@@ -17,8 +17,10 @@ import shapely
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_PARCELS = (
-    PROJECT_ROOT / "input/cadastral/Montana_Cadastral/OWNERPARCEL.shp"
+DEFAULT_PARCELS = PROJECT_ROOT / "input/Montana_Cadastral/OWNERPARCEL.shp"
+DEFAULT_ROUTES = (
+    ("primary-route", PROJECT_ROOT / "output/primary-route"),
+    ("secondary-route", PROJECT_ROOT / "output/secondary-route"),
 )
 SQ_METERS_PER_ACRE = 4_046.8564224
 METERS_PER_MILE = 1_609.344
@@ -34,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pipeline",
         type=Path,
-        help="Pipeline .shp path (default: the only .shp in input/shapefile).",
+        help="Process only this pipeline .shp (default: process both route directories).",
     )
     parser.add_argument(
         "--parcels",
@@ -45,8 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PROJECT_ROOT / "output",
-        help="Output directory (default: output).",
+        help=(
+            "Output directory for --pipeline (default: output), or a parent directory "
+            "for both route subdirectories (defaults: output/primary-route and "
+            "output/secondary-route)."
+        ),
     )
     parser.add_argument(
         "--adjacency-tolerance",
@@ -74,13 +79,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def find_pipeline(path: Path | None) -> Path:
-    if path is not None:
-        return path.resolve()
-    candidates = sorted((PROJECT_ROOT / "input/shapefile").glob("*.shp"))
+def find_pipeline(directory: Path) -> Path:
+    candidates = sorted(directory.glob("*.shp"))
     if len(candidates) != 1:
         raise RuntimeError(
-            "Expected exactly one pipeline .shp in input/shapefile; "
+            f"Expected exactly one pipeline .shp in {directory}; "
             "pass --pipeline explicitly."
         )
     return candidates[0]
@@ -364,9 +367,13 @@ def make_owner_features(
 
 def write_outputs(owners: gpd.GeoDataFrame, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "landowners.csv"
-    txt_path = output_dir / "landowners.txt"
-    geojson_path = output_dir / "landowners.geojson"
+    stem = {
+        "primary-route": "primary-landowners",
+        "secondary-route": "secondary-landowners",
+    }.get(output_dir.name, "landowners")
+    csv_path = output_dir / f"{stem}.csv"
+    txt_path = output_dir / f"{stem}.txt"
+    geojson_path = output_dir / f"{stem}.geojson"
 
     tabular = pd.DataFrame(owners.drop(columns="geometry"))
     tabular.to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -394,17 +401,17 @@ def write_outputs(owners: gpd.GeoDataFrame, output_dir: Path) -> None:
     )
 
 
-def main() -> int:
-    args = parse_args()
-    pipeline_path = find_pipeline(args.pipeline)
-    parcels_path = args.parcels.resolve()
-    output_dir = args.output_dir.resolve()
-    require_inputs(pipeline_path, parcels_path)
-
+def process_pipeline(
+    pipeline_path: Path,
+    parcels_path: Path,
+    output_dir: Path,
+    pipeline_buffer: float,
+    adjacency_tolerance: float,
+) -> None:
     print(f"Pipeline: {pipeline_path}", flush=True)
     print(f"Parcels:  {parcels_path}", flush=True)
     hits, pipeline_geometry = read_pipeline_hits(
-        pipeline_path, parcels_path, args.pipeline_buffer
+        pipeline_path, parcels_path, pipeline_buffer
     )
     named_count = hits.loc[hits["OwnerName"].notna(), "OwnerName"].nunique()
     unnamed_count = int(hits["OwnerName"].isna().sum())
@@ -419,11 +426,41 @@ def main() -> int:
         f"Testing connectivity among {len(relevant):,} parcels belonging to hit owners ...",
         flush=True,
     )
-    selected = connected_to_pipeline(relevant, args.adjacency_tolerance)
+    selected = connected_to_pipeline(relevant, adjacency_tolerance)
     print(f"Selected {len(selected):,} connected parcels; dissolving by owner ...", flush=True)
     owners = make_owner_features(selected, pipeline_geometry)
     write_outputs(owners, output_dir)
     print(f"Wrote {len(owners):,} owner holdings to {output_dir}", flush=True)
+
+
+def main() -> int:
+    args = parse_args()
+    parcels_path = args.parcels.resolve()
+    if args.pipeline is not None:
+        routes = [
+            (
+                args.pipeline.resolve(),
+                (args.output_dir or PROJECT_ROOT / "output").resolve(),
+            )
+        ]
+    else:
+        routes = [
+            (
+                find_pipeline(PROJECT_ROOT / "input" / name),
+                (args.output_dir / name if args.output_dir else output_dir).resolve(),
+            )
+            for name, output_dir in DEFAULT_ROUTES
+        ]
+
+    require_inputs(parcels_path, *(pipeline_path for pipeline_path, _ in routes))
+    for pipeline_path, output_dir in routes:
+        process_pipeline(
+            pipeline_path,
+            parcels_path,
+            output_dir,
+            args.pipeline_buffer,
+            args.adjacency_tolerance,
+        )
     return 0
 
 
